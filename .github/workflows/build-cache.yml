@@ -39,7 +39,7 @@ jobs:
       - name: Build cache
         env:
           DATA_GO_KR_API_KEY: ${{ secrets.DATA_GO_KR_API_KEY }}
-        run: python scripts/build_cache.py --output docs/lh_cache_v1.json --verbose
+        run: python scripts/build_cache.py --output docs/lh_cache_v1.json --deadline-seconds 1200 --verbose
 
       - name: Commit cache if changed
         run: |

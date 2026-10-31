@@ -5,14 +5,20 @@ schedule data for the LH청약알리미 app.
 Data source: 한국토지주택공사 공공데이터 (data.go.kr). Standard library only.
 
 Steps per run:
-1. List current notices (types 06/05/39/13, status 공고중/접수중/정정공고중,
-   posted within the last 90 days), all pages.
-2. Load the previous cache file. For notices that are new, (newly) 정정공고중,
-   incomplete, or fetched more than 7 days ago, call the supply-info and
-   detail-info APIs. Everything else reuses the previous value (incremental).
-3. Error responses (HTTP errors, non-JSON / XML OpenAPI_ServiceResponse,
-   resHeader SS_CODE != "Y") keep the previous value and are counted.
+1. List current notices (types 06/05/39/13, status 공고중/접수중/정정공고중),
+   all pages. The status bounds the range; the date params are as wide as the
+   app's own list call.
+2. Load the previous cache file. Refresh supply-info and detail-info for notices
+   that are new, incomplete, whose status differs from the status they were
+   last fetched under, 정정공고중 (every 24 h), with empty blocks (every 24 h),
+   or fetched more than 7 days ago. Everything else reuses the previous value.
+3. Error responses (HTTP/transport errors, non-JSON / XML
+   OpenAPI_ServiceResponse, resHeader SS_CODE != "Y") keep the previous value
+   and are counted. A run deadline stops refreshing and writes what is done.
 4. Notices no longer listed are dropped 30 days after they were last seen.
+5. The file is rewritten only when the notices changed, or as a heartbeat when
+   the previous generated_at is 20 h old (the app treats generated_at older
+   than 48 h as stale). Unchanged runs leave the file — and its ETag — alone.
 
 The raw response blocks are stored unchanged so the app's existing Dart
 parsers read them as-is:
@@ -28,7 +34,9 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import http.client
 import json
+import math
 import os
 import re
 import sys
@@ -38,7 +46,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable
 
@@ -74,16 +82,24 @@ Transport = Callable[[str, dict], str]
 class Config:
     max_calls: int = 600
     page_size: int = 100
-    max_pages: int = 20
-    window_days: int = 90
+    max_pages: int = 20          # per status/type combo, raised up to max_pages_hard by ALL_CNT
+    max_pages_hard: int = 60
     refresh_days: int = 7
-    correction_refresh_hours: int = 24
+    recheck_hours: int = 24      # 정정공고중 and empty-block entries
     drop_days: int = 30
+    heartbeat_hours: int = 20    # rewrite an unchanged file once its generated_at is this old
+    deadline_seconds: float = 1200.0
+    fail_ratio: float = 0.8      # exit 1 when this share of detail calls fail ...
+    fail_min_count: int = 5      # ... and at least this many failed
     sleep_seconds: float = 0.3
 
 
 class ApiError(Exception):
     """A response that must not overwrite the previous value."""
+
+
+class DeadlineReached(Exception):
+    """The run deadline passed; stop calling the API."""
 
 
 # ---------------------------------------------------------------- utilities
@@ -110,16 +126,6 @@ def parse_iso(value) -> datetime | None:
     except ValueError:
         return None
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=KST)
-
-
-def parse_lh_date(value) -> datetime | None:
-    match = re.search(r"(\d{4})[.\-/]?(\d{2})[.\-/]?(\d{2})", str(value or ""))
-    if not match:
-        return None
-    try:
-        return datetime(int(match[1]), int(match[2]), int(match[3]), tzinfo=KST)
-    except ValueError:
-        return None
 
 
 def http_get(url: str, params: dict, timeout: float = 20.0) -> str:
@@ -172,24 +178,32 @@ def pick_blocks(data, pattern: re.Pattern) -> dict:
 
 class Builder:
     def __init__(self, key: str, transport: Transport, now: datetime, config: Config,
-                 sleep: Callable[[float], None], log: Callable[[str], None]):
+                 sleep: Callable[[float], None], log: Callable[[str], None],
+                 clock: Callable[[], float]):
         self.key = key
         self.transport = transport
         self.now = now
         self.config = config
         self.sleep = sleep
         self.log = log
+        self.clock = clock
+        self.started = clock()
         self.calls = 0
         self.stats = {
             "listed": 0, "notices": 0, "refreshed": 0,
             "list_calls": 0, "supply_calls": 0, "schedule_calls": 0,
             "failures": {"list": 0, "supply": 0, "schedule": 0},
-            "dropped": 0, "skipped_by_cap": 0,
+            "dropped": 0, "skipped_by_cap": 0, "skipped_by_deadline": 0,
         }
 
     # -- transport --------------------------------------------------------
 
+    def past_deadline(self) -> bool:
+        return self.clock() - self.started >= self.config.deadline_seconds
+
     def call(self, url: str, params: dict):
+        if self.past_deadline():
+            raise DeadlineReached()
         if self.calls > 0 and self.config.sleep_seconds > 0:
             self.sleep(self.config.sleep_seconds)
         self.calls += 1
@@ -198,7 +212,7 @@ class Builder:
         except urllib.error.HTTPError as e:
             e.close()
             raise ApiError(f"HTTP {e.code}") from None
-        except (urllib.error.URLError, OSError, ValueError) as e:
+        except (urllib.error.URLError, http.client.HTTPException, OSError, ValueError) as e:
             raise ApiError(redact(f"{type(e).__name__}: {e}", self.key)) from None
         return check_response(text)
 
@@ -206,33 +220,37 @@ class Builder:
 
     def list_notices(self) -> tuple[dict, int, int]:
         """Return ({PAN_ID: row}, ok_combos, failed_combos)."""
-        start = (self.now.astimezone(KST) - timedelta(days=self.config.window_days)).date()
         rows: dict = {}
         ok = failed = 0
         for upp in UPP_TYPES:
             for status in STATUSES:
                 try:
-                    for r in self.list_combo(upp, status, start):
+                    for r in self.list_combo(upp, status):
                         rows.setdefault(str(r.get("PAN_ID", "")).strip(), r)
                     ok += 1
-                except ApiError as e:
+                except (ApiError, DeadlineReached) as e:
                     failed += 1
                     self.stats["failures"]["list"] += 1
-                    self.log(f"list {upp}/{status} failed: {redact(str(e), self.key)}")
+                    reason = "deadline" if isinstance(e, DeadlineReached) else str(e)
+                    self.log(f"list {upp}/{status} failed: {redact(reason, self.key)}")
         rows.pop("", None)
         return rows, ok, failed
 
-    def list_combo(self, upp: str, status: str, start) -> list:
+    def list_combo(self, upp: str, status: str) -> list:
         cfg = self.config
+        year = self.now.astimezone(KST).year
         params = {
             "PG_SZ": cfg.page_size,
             "UPP_AIS_TP_CD": upp,
             "PAN_SS": status,
-            "PAN_NT_ST_DT": start.strftime("%Y.%m.%d"),
-            "CLSG_DT": f"{self.now.astimezone(KST).year + 1}.12.31",
+            "PAN_NT_ST_DT": f"{year - 1}.01.01",
+            "CLSG_DT": f"{year + 1}.12.31",
         }
         collected: list = []
-        for page in range(1, cfg.max_pages + 1):
+        page_cap = cfg.max_pages
+        page = 0
+        while page < page_cap:
+            page += 1
             if self.calls >= cfg.max_calls:
                 raise ApiError("call cap reached while listing")
             self.stats["list_calls"] += 1
@@ -242,13 +260,15 @@ class Builder:
             if not page_rows:
                 break
             total = _int(page_rows[0].get("ALL_CNT"))
-            if total is not None:
-                if len(collected) >= total:
+            if total is None:
+                if len(page_rows) < cfg.page_size:
                     break
-            elif len(page_rows) < cfg.page_size:
+                continue
+            if len(collected) >= total:
                 break
-        cutoff = datetime.combine(start, datetime.min.time(), tzinfo=KST)
-        return [r for r in collected if (parse_lh_date(r.get("PAN_NT_ST_DT")) or cutoff) >= cutoff]
+            needed = math.ceil(total / len(page_rows))
+            page_cap = min(max(page_cap, needed), cfg.max_pages_hard)
+        return collected
 
     # -- refresh ----------------------------------------------------------
 
@@ -258,12 +278,14 @@ class Builder:
         fetched = parse_iso(prev.get("fetched_at"))
         if fetched is None:
             return "incomplete"
+        if status != prev.get("fetched_status"):
+            return "status_changed"
         age = self.now - fetched
-        if status == CORRECTION and (
-            prev.get("status") != CORRECTION
-            or age >= timedelta(hours=self.config.correction_refresh_hours)
-        ):
+        recheck = timedelta(hours=self.config.recheck_hours)
+        if status == CORRECTION and age >= recheck:
             return "correction"
+        if age >= recheck and _has_empty_block(prev):
+            return "empty"
         if age >= timedelta(days=self.config.refresh_days):
             return "expired"
         return None
@@ -296,10 +318,25 @@ class Builder:
             entry["schedule"] = schedule
         if complete:
             entry["fetched_at"] = iso(self.now)
+            entry["fetched_status"] = entry["status"]
         self.stats["refreshed"] += 1
 
     def calls_needed(self, entry: dict) -> int:
         return 2 if entry["codes"].get("UPP_AIS_TP_CD") in SUPPLY_ELIGIBLE else 1
+
+    def refresh_queue(self, queue: list, notices: dict) -> None:
+        for _prio, _fetched, pan_id in sorted(queue):
+            entry = notices[pan_id]
+            if self.past_deadline():
+                self.stats["skipped_by_deadline"] += 1
+                continue
+            if self.calls + self.calls_needed(entry) > self.config.max_calls:
+                self.stats["skipped_by_cap"] += 1
+                continue
+            try:
+                self.refresh(entry, pan_id)
+            except DeadlineReached:
+                self.stats["skipped_by_deadline"] += 1
 
     # -- whole run --------------------------------------------------------
 
@@ -309,6 +346,7 @@ class Builder:
         if ok_combos == 0:
             return {}, False
         self.stats["listed"] = len(listed)
+        today = self.now.astimezone(KST).date()
 
         notices: dict = {}
         queue: list = []
@@ -316,29 +354,24 @@ class Builder:
             prev = prev_notices.get(pan_id)
             status = str(r.get("PAN_SS", "")).strip()
             entry = {
-                "fetched_at": None, "supply": None, "schedule": None,
+                "fetched_at": None, "fetched_status": None, "supply": None, "schedule": None,
                 **(prev or {}),
                 "status": status,
                 "codes": _codes(r),
-                "last_seen_at": iso(self.now),
+                "last_seen_at": today.isoformat(),
             }
             notices[pan_id] = entry
             reason = self.refresh_reason(prev, status)
             if reason:
                 queue.append((_PRIORITY[reason], (prev or {}).get("fetched_at") or "", pan_id))
 
-        for _prio, _fetched, pan_id in sorted(queue):
-            entry = notices[pan_id]
-            if self.calls + self.calls_needed(entry) > self.config.max_calls:
-                self.stats["skipped_by_cap"] += 1
-                continue
-            self.refresh(entry, pan_id)
+        self.refresh_queue(queue, notices)
 
-        drop_before = self.now - timedelta(days=self.config.drop_days)
+        drop_before = today - timedelta(days=self.config.drop_days)
         for pan_id, prev in prev_notices.items():
             if pan_id in notices:
                 continue
-            seen = parse_iso(prev.get("last_seen_at"))
+            seen = _seen_date(prev.get("last_seen_at"))
             if failed_combos == 0 and (seen is None or seen < drop_before):
                 self.stats["dropped"] += 1
                 continue
@@ -357,7 +390,7 @@ class Builder:
         return doc, True
 
 
-_PRIORITY = {"new": 0, "incomplete": 1, "correction": 2, "expired": 3}
+_PRIORITY = {"new": 0, "incomplete": 1, "status_changed": 2, "correction": 3, "empty": 4, "expired": 5}
 
 
 def _int(value) -> int | None:
@@ -367,8 +400,25 @@ def _int(value) -> int | None:
         return None
 
 
+def _has_empty_block(entry: dict) -> bool:
+    eligible = (entry.get("codes") or {}).get("UPP_AIS_TP_CD") in SUPPLY_ELIGIBLE
+    return entry.get("schedule") == {} or (eligible and entry.get("supply") == {})
+
+
+def _seen_date(value) -> date | None:
+    parsed = parse_iso(value)
+    return parsed.date() if parsed else None
+
+
+def _dtl_query(url) -> dict:
+    try:
+        return urllib.parse.parse_qs(urllib.parse.urlsplit(str(url or "")).query)
+    except ValueError:  # e.g. "Invalid IPv6 URL"
+        return {}
+
+
 def _codes(r: dict) -> dict:
-    query = urllib.parse.parse_qs(urllib.parse.urlsplit(str(r.get("DTL_URL") or "")).query)
+    query = _dtl_query(r.get("DTL_URL"))
     codes = {}
     for field in CODE_FIELDS:
         value = str(r.get(field) or "").strip()
@@ -389,9 +439,26 @@ def _previous_notices(previous) -> dict:
 
 def build(previous, key: str, transport: Transport, now: datetime, config: Config,
           sleep: Callable[[float], None] = time.sleep,
-          log: Callable[[str], None] = lambda _m: None) -> tuple[dict, bool]:
+          log: Callable[[str], None] = lambda _m: None,
+          clock: Callable[[], float] = time.monotonic) -> tuple[dict, bool]:
     """Pure entry point used by tests. Returns (document, listing_ok)."""
-    return Builder(key, transport, now, config, sleep, log).build(previous)
+    return Builder(key, transport, now, config, sleep, log, clock).build(previous)
+
+
+def should_write(previous, doc: dict, now: datetime, config: Config) -> bool:
+    """Rewrite only when notices changed, or as a heartbeat (generated_at 20 h old)."""
+    if not isinstance(previous, dict) or previous.get("schema") != SCHEMA:
+        return True
+    if previous.get("notices") != doc["notices"]:
+        return True
+    generated = parse_iso(previous.get("generated_at"))
+    return generated is None or now - generated >= timedelta(hours=config.heartbeat_hours)
+
+
+def too_many_failures(stats: dict, config: Config) -> bool:
+    attempted = stats["supply_calls"] + stats["schedule_calls"]
+    failed = stats["failures"]["supply"] + stats["failures"]["schedule"]
+    return failed >= config.fail_min_count and failed >= attempted * config.fail_ratio
 
 
 # ---------------------------------------------------------------- CLI
@@ -412,7 +479,7 @@ def write_atomic(path: Path, doc: dict) -> None:
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".lh_cache_", suffix=".json")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(doc, f, ensure_ascii=False, separators=(",", ":"), sort_keys=False)
+            json.dump(doc, f, ensure_ascii=False, separators=(",", ":"))
             f.write("\n")
         os.replace(tmp, path)
     except BaseException:
@@ -432,6 +499,7 @@ def main(argv=None, transport: Transport = http_get) -> int:
     parser.add_argument("--output", default="docs/lh_cache_v1.json")
     parser.add_argument("--max-calls", type=int, default=Config.max_calls)
     parser.add_argument("--sleep", type=float, default=Config.sleep_seconds)
+    parser.add_argument("--deadline-seconds", type=float, default=Config.deadline_seconds)
     parser.add_argument("--verbose", action="store_true", help="log each failed call (redacted)")
     args = parser.parse_args(argv)
 
@@ -445,26 +513,28 @@ def main(argv=None, transport: Transport = http_get) -> int:
         return 2
 
     output = Path(args.output)
-    config = Config(max_calls=args.max_calls, sleep_seconds=args.sleep)
+    config = Config(max_calls=args.max_calls, sleep_seconds=args.sleep,
+                    deadline_seconds=args.deadline_seconds)
 
     def log(message: str) -> None:
         if args.verbose:
             print(redact(message, key), file=sys.stderr)
 
-    doc, listing_ok = build(load_previous(output), key, transport,
-                            datetime.now(KST), config, log=log)
+    previous = load_previous(output)
+    now = datetime.now(KST)
+    doc, listing_ok = build(previous, key, transport, now, config, log=log)
     if not listing_ok:
         print("ERROR: every notice-list call failed; previous cache left unchanged.", file=sys.stderr)
         return 1
 
-    stats = doc["stats"]
-    attempted = stats["supply_calls"] + stats["schedule_calls"]
-    failed = stats["failures"]["supply"] + stats["failures"]["schedule"]
-    summary = json.dumps(stats, ensure_ascii=False)
-    if attempted > 0 and failed == attempted:
-        print(f"ERROR: every supply/detail call failed; cache not updated. stats={summary}", file=sys.stderr)
+    summary = json.dumps(doc["stats"], ensure_ascii=False)
+    if too_many_failures(doc["stats"], config):
+        print(f"ERROR: most supply/detail calls failed; cache not updated. stats={summary}", file=sys.stderr)
         return 1
 
+    if not should_write(previous, doc, now, config):
+        print(f"cache unchanged; {output} left as is. stats={summary}")
+        return 0
     write_atomic(output, doc)
     print(redact(f"wrote {output} stats={summary}", key))
     return 0

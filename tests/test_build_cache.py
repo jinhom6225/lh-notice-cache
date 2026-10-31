@@ -1,6 +1,7 @@
 """Unit tests for scripts/build_cache.py (stdlib unittest, no network)."""
 
 import contextlib
+import http.client
 import io
 import json
 import os
@@ -18,7 +19,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import build_cache  # noqa: E402
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
-KEY = "f05eTESTKEY+abc/def=="  # fake key with characters that get percent-encoded
+KEY = "TESTKEY+abc/def=="  # fake key with characters that get percent-encoded
 NOW = datetime(2026, 11, 1, 6, 0, tzinfo=build_cache.KST)
 
 
@@ -92,23 +93,26 @@ class FakeTransport:
         return [p["PAN_ID"] for u, p in self.calls if u == url]
 
 
-def run_build(transport, prev=None, now=NOW, **cfg):
+def run_build(transport, prev=None, now=NOW, clock=None, **cfg):
     config = build_cache.Config(sleep_seconds=0, **cfg)
-    return build_cache.build(prev, KEY, transport, now, config, sleep=lambda _s: None)
+    return build_cache.build(prev, KEY, transport, now, config, sleep=lambda _s: None,
+                             clock=clock or (lambda: 0.0))
 
 
 def iso(dt):
     return dt.isoformat(timespec="seconds")
 
 
-def prev_entry(fetched, status="공고중", upp="06", last_seen=None):
+def prev_entry(fetched, status="공고중", upp="06", last_seen=None, fetched_status=None,
+               schedule=None):
     return {
         "fetched_at": iso(fetched) if fetched else None,
-        "last_seen_at": iso(last_seen or fetched or NOW),
+        "fetched_status": fetched_status or status,
+        "last_seen_at": (last_seen or fetched or NOW).date().isoformat(),
         "status": status,
         "codes": {"UPP_AIS_TP_CD": upp, "CCR_CNNT_SYS_DS_CD": "03", "SPL_INF_TP_CD": "063"},
         "supply": {"dsList01": [{"DDO_AR": "old"}], "dsList01Nm": [{"DDO_AR": "전용면적"}]},
-        "schedule": {"dsSplScdl": [{"SBSC_ACP_ST_DT": "old"}]},
+        "schedule": schedule if schedule is not None else {"dsSplScdl": [{"SBSC_ACP_ST_DT": "old"}]},
     }
 
 
@@ -117,7 +121,7 @@ def prev_doc(notices):
 
 
 class ListingTests(unittest.TestCase):
-    def test_lists_every_type_and_status_with_window_params(self):
+    def test_lists_every_type_and_status_with_wide_date_params(self):
         t = FakeTransport()
         run_build(t)
         list_calls = [p for u, p in t.calls if u == build_cache.LIST_URL]
@@ -129,7 +133,9 @@ class ListingTests(unittest.TestCase):
         first = list_calls[0]
         self.assertEqual(first["PG_SZ"], 100)
         self.assertEqual(first["PAGE"], 1)
-        self.assertEqual(first["PAN_NT_ST_DT"], "2026.08.03")  # 90 days back
+        # status bounds the range (H1a): same wide window as the app, no 90-day cut
+        self.assertEqual(first["PAN_NT_ST_DT"], "2025.01.01")
+        self.assertEqual(first["CLSG_DT"], "2027.12.31")
         self.assertEqual(first["serviceKey"], KEY)
 
     def test_pages_until_all_cnt_is_reached(self):
@@ -151,11 +157,26 @@ class ListingTests(unittest.TestCase):
         doc, _ = run_build(t, max_calls=2000)
         self.assertEqual(len(doc["notices"]), 80)
 
-    def test_drops_rows_posted_before_the_90_day_window(self):
-        page = list_body([row("recent"), row("ancient", posted="2026.01.05")])
+    def test_keeps_active_notices_posted_long_ago(self):
+        page = list_body([row("recent"), row("ancient", posted="2025.03.05")])
         t = FakeTransport(listing={("06", "공고중"): [page]})
         doc, _ = run_build(t)
-        self.assertEqual(set(doc["notices"]), {"recent"})
+        self.assertEqual(set(doc["notices"]), {"recent", "ancient"})
+
+    def test_raises_page_cap_when_all_cnt_is_large(self):
+        pages = [list_body([row(f"p{n}_{i}") for i in range(100)], all_cnt=350) for n in range(3)]
+        pages.append(list_body([row(f"p3_{i}") for i in range(50)], all_cnt=350))
+        t = FakeTransport(listing={("06", "공고중"): pages})
+        doc, _ = run_build(t, max_pages=2, max_calls=5000)
+        self.assertEqual(doc["stats"]["listed"], 350)
+
+    def test_page_cap_is_still_bounded_by_the_hard_limit(self):
+        huge = list_body([row(f"x{i}") for i in range(100)], all_cnt=100000)
+        t = FakeTransport(listing={("06", "공고중"): [huge] * 500})
+        run_build(t, max_calls=5000)
+        pages = [p for u, p in t.calls if u == build_cache.LIST_URL and p["UPP_AIS_TP_CD"] == "06"
+                 and p["PAN_SS"] == "공고중"]
+        self.assertEqual(len(pages), build_cache.Config().max_pages_hard)
 
     def test_reads_the_crafted_list_fixture(self):
         t = FakeTransport(listing={("06", "공고중"): [fixture_text("list_page.json")]})
@@ -182,6 +203,8 @@ class EntryShapeTests(unittest.TestCase):
         self.assertEqual(entry["codes"]["SPL_INF_TP_CD"], "063")
         self.assertEqual(entry["status"], "공고중")
         self.assertEqual(entry["fetched_at"], "2026-11-01T06:00:00+09:00")
+        self.assertEqual(entry["fetched_status"], "공고중")
+        self.assertEqual(entry["last_seen_at"], "2026-11-01")  # date granularity (M4)
 
     def test_multi_block_supply_keeps_all_blocks_including_empty_ones(self):
         page = list_body([row("2015122300019001", spl="060")])
@@ -202,6 +225,13 @@ class EntryShapeTests(unittest.TestCase):
         self.assertEqual(supply_params["CCR_CNNT_SYS_DS_CD"], "03")
         self.assertEqual(supply_params["SPL_INF_TP_CD"], "063")
         self.assertEqual(supply_params["UPP_AIS_TP_CD"], "06")
+
+    def test_malformed_dtl_url_does_not_crash(self):
+        r = {"PAN_ID": "p8", "PAN_SS": "공고중", "UPP_AIS_TP_CD": "06", "DTL_URL": "http://[bad-ipv6/x?panId=p8"}
+        t = FakeTransport(listing={("06", "공고중"): [list_body([r])]})
+        doc, ok = run_build(t)
+        self.assertTrue(ok)
+        self.assertEqual(doc["notices"]["p8"]["codes"]["UPP_AIS_TP_CD"], "06")
 
     def test_codes_fall_back_to_dtl_url_query(self):
         r = {"PAN_ID": "p9", "PAN_SS": "공고중", "PAN_NT_ST_DT": "2026.10.30",
@@ -252,7 +282,7 @@ class IncrementalTests(unittest.TestCase):
         # reused entries keep their old blocks and fetched_at
         self.assertEqual(doc["notices"]["fresh"]["supply"]["dsList01"][0]["DDO_AR"], "old")
         self.assertEqual(doc["notices"]["fresh"]["fetched_at"], iso(NOW - timedelta(days=1)))
-        self.assertEqual(doc["notices"]["fresh"]["last_seen_at"], iso(NOW))
+        self.assertEqual(doc["notices"]["fresh"]["last_seen_at"], "2026-11-01")
         self.assertEqual(doc["notices"]["old"]["supply"]["dsList01"][0]["DDO_AR"], "16.98")
         self.assertEqual(doc["stats"]["refreshed"], 3)
 
@@ -262,6 +292,44 @@ class IncrementalTests(unittest.TestCase):
         t = FakeTransport(listing={("06", "공고중"): [listing]})
         run_build(t, prev=prev)
         self.assertEqual(t.detail_calls(build_cache.SUPPLY_URL), ["corr"])
+
+    def test_failed_correction_refresh_is_retried_next_run(self):
+        # last run saw 정정공고중 but the refresh failed -> fetched_status still 공고중 (M3)
+        listing = list_body([row("corr", status="정정공고중")])
+        prev = prev_doc({"corr": prev_entry(NOW - timedelta(hours=2), status="정정공고중",
+                                            fetched_status="공고중")})
+        t = FakeTransport(listing={("06", "공고중"): [listing]})
+        doc, _ = run_build(t, prev=prev)
+        self.assertEqual(t.detail_calls(build_cache.SUPPLY_URL), ["corr"])
+        self.assertEqual(doc["notices"]["corr"]["fetched_status"], "정정공고중")
+
+    def test_status_change_other_than_correction_triggers_refresh(self):
+        listing = list_body([row("p1", status="접수중")])
+        prev = prev_doc({"p1": prev_entry(NOW - timedelta(hours=2), status="공고중")})
+        t = FakeTransport(listing={("06", "공고중"): [listing]})
+        run_build(t, prev=prev)
+        self.assertEqual(t.detail_calls(build_cache.DETAIL_URL), ["p1"])
+
+    def test_empty_blocks_are_refetched_after_24_hours(self):
+        listing = list_body([row("e_old"), row("e_new")])
+        prev = prev_doc({
+            "e_old": prev_entry(NOW - timedelta(hours=25), schedule={}),
+            "e_new": prev_entry(NOW - timedelta(hours=23), schedule={}),
+        })
+        t = FakeTransport(listing={("06", "공고중"): [listing]})
+        run_build(t, prev=prev)
+        self.assertEqual(t.detail_calls(build_cache.DETAIL_URL), ["e_old"])
+
+    def test_deadline_stops_refreshing_and_keeps_what_is_done(self):
+        listing = list_body([row(f"n{i}") for i in range(10)])
+        t = FakeTransport(listing={("06", "공고중"): [listing]})
+        ticks = iter(range(0, 100000, 1))  # one second per clock read
+        doc, ok = run_build(t, deadline_seconds=20, clock=lambda: next(ticks))
+        self.assertTrue(ok)
+        self.assertGreater(doc["stats"]["skipped_by_deadline"], 0)
+        refreshed = [e for e in doc["notices"].values() if e["fetched_at"]]
+        self.assertEqual(len(refreshed), doc["stats"]["refreshed"])
+        self.assertLess(len(refreshed), 10)
 
     def test_unlisted_notice_is_kept_for_30_days_then_dropped(self):
         prev = prev_doc({
@@ -335,6 +403,14 @@ class ErrorHandlingTests(unittest.TestCase):
         doc, _ = self._run_with(supply_value=err)
         self.assert_supply_kept(doc)
 
+    def test_incomplete_read_keeps_previous_value(self):
+        doc, _ = self._run_with(supply_value=http.client.IncompleteRead(b"partial"))
+        self.assert_supply_kept(doc)
+
+    def test_bad_status_line_keeps_previous_value(self):
+        doc, _ = self._run_with(supply_value=http.client.BadStatusLine("garbage"))
+        self.assert_supply_kept(doc)
+
     def test_non_json_garbage_keeps_previous_value(self):
         doc, _ = self._run_with(supply_value="<html>maintenance</html>")
         self.assert_supply_kept(doc)
@@ -356,7 +432,8 @@ class OutputTests(unittest.TestCase):
         self.assertIn("data.go.kr", doc["source"])
         self.assertIn("이용허락범위 제한 없음", doc["license"])
         for name in ("listed", "notices", "refreshed", "list_calls", "supply_calls",
-                     "schedule_calls", "failures", "dropped", "skipped_by_cap"):
+                     "schedule_calls", "failures", "dropped", "skipped_by_cap",
+                     "skipped_by_deadline"):
             self.assertIn(name, doc["stats"])
         self.assertEqual(doc["stats"]["listed"], 1)
 
@@ -423,15 +500,52 @@ class MainTests(unittest.TestCase):
         self.assertNotEqual(code, 0)
         self.assertEqual(self.out.read_text(encoding="utf-8"), before)
 
-    def test_all_detail_calls_failing_exits_nonzero_without_bumping_file(self):
+    def test_mostly_failing_detail_calls_exit_nonzero_without_bumping_file(self):
+        ids = [f"p{i}" for i in range(5)]
         t = FakeTransport(
-            listing={("06", "공고중"): [list_body([row("p1"), row("p2")])]},
-            supply={"p1": XML_ERROR, "p2": XML_ERROR},
-            detail={"p1": XML_ERROR, "p2": XML_ERROR},
+            listing={("06", "공고중"): [list_body([row(i) for i in ids])]},
+            supply={i: XML_ERROR for i in ids},
+            detail={i: XML_ERROR for i in ids},
         )
         code, _ = self.run_main(t)
         self.assertNotEqual(code, 0)
         self.assertFalse(self.out.exists())
+
+    def test_a_few_failures_below_the_minimum_count_still_write(self):
+        t = FakeTransport(
+            listing={("06", "공고중"): [list_body([row("p1")])]},
+            supply={"p1": XML_ERROR},
+            detail={"p1": XML_ERROR},
+        )
+        code, _ = self.run_main(t)
+        self.assertEqual(code, 0)
+        self.assertTrue(self.out.exists())
+
+    def test_unchanged_notices_do_not_rewrite_the_file(self):
+        listing = {("06", "공고중"): [list_body([row("p1")])]}
+        self.assertEqual(self.run_main(FakeTransport(listing=listing))[0], 0)
+        before = self.out.read_text(encoding="utf-8")
+        code, logs = self.run_main(FakeTransport(listing=listing))
+        self.assertEqual(code, 0)
+        self.assertEqual(self.out.read_text(encoding="utf-8"), before)  # same bytes -> same ETag
+        self.assertIn("unchanged", logs)
+
+    def test_heartbeat_rewrites_unchanged_file_after_20_hours(self):
+        listing = {("06", "공고중"): [list_body([row("p1")])]}
+        self.run_main(FakeTransport(listing=listing))
+        doc = json.loads(self.out.read_text(encoding="utf-8"))
+        old = (datetime.now(build_cache.KST) - timedelta(hours=21)).isoformat(timespec="seconds")
+        doc["generated_at"] = old
+        self.out.write_text(json.dumps(doc, ensure_ascii=False), encoding="utf-8")
+        self.run_main(FakeTransport(listing=listing))
+        rewritten = json.loads(self.out.read_text(encoding="utf-8"))
+        self.assertNotEqual(rewritten["generated_at"], old)
+
+    def test_changed_notices_rewrite_the_file(self):
+        self.run_main(FakeTransport(listing={("06", "공고중"): [list_body([row("p1")])]}))
+        self.run_main(FakeTransport(listing={("06", "공고중"): [list_body([row("p1"), row("p2")])]}))
+        doc = json.loads(self.out.read_text(encoding="utf-8"))
+        self.assertIn("p2", doc["notices"])
 
     def test_key_never_appears_in_logs_or_output(self):
         encoded = build_cache.urllib.parse.quote(KEY, safe="")
