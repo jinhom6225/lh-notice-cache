@@ -1,0 +1,21 @@
+[
+  {"_note": "research.md 8 실측(2026-11-01) 재구성 - 공공임대 SPL_INF_TP_CD 060, 데이터는 dsList02만. 실제 응답 표본 캡처 대기"},
+  {"dsSch": [{"PAN_ID": "2015122300019001", "CCR_CNNT_SYS_DS_CD": "03", "SPL_INF_TP_CD": "060", "UPP_AIS_TP_CD": "06"}]},
+  {
+    "dsList01": [],
+    "dsList01Nm": [{"HTY_NM": "주택형", "SIL_AMT": "평균분양가격"}],
+    "dsList02": [
+      {"BZDT_NM": "울산송정 B-3", "HTY_NM": "084.9700A", "RSDN_DDO_AR": 84.97, "SPL_AR": 112.3, "TOT_HSH_CNT": 300, "SIL_HSH_CNT": 12, "LS_GMY": 60460000, "MM_RFE": 680000}
+    ],
+    "dsList02Nm": [
+      {"BZDT_NM": "단지명", "HTY_NM": "주택형", "RSDN_DDO_AR": "전용면적", "SPL_AR": "공급면적", "TOT_HSH_CNT": "세대수", "SIL_HSH_CNT": "금회공급세대수", "LS_GMY": "임대보증금", "MM_RFE": "월임대료"}
+    ],
+    "dsList03": [],
+    "dsList03Nm": [{"HTY_NM": "주택형", "ELY_DSU_AMT": "초기분납금"}],
+    "dsList04": [],
+    "dsList04Nm": [{"HTY_NM": "주택형"}],
+    "dsList05": [],
+    "dsList05Nm": [{"HTY_NM": "주택형"}]
+  },
+  {"resHeader": [{"SS_CODE": "Y", "RS_DTTM": "20261101093000"}]}
+]

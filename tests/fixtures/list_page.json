@@ -1,0 +1,9 @@
+[
+  {"_note": "Crafted from the LH lease notice list API response shape (lhLeaseNoticeInfo1) used by the app. Not a live capture."},
+  {"dsSch": [{"PG_SZ": "100", "PAGE": "1", "UPP_AIS_TP_CD": "06", "PAN_SS": "공고중"}]},
+  {"dsList": [
+    {"RNUM": "1", "ALL_CNT": "2", "PAN_ID": "2015122300019236", "PAN_NM": "과천지식정보타운 S12 행복주택 입주자 모집", "UPP_AIS_TP_CD": "06", "UPP_AIS_TP_NM": "임대주택", "AIS_TP_CD": "10", "AIS_TP_CD_NM": "행복주택", "CNP_CD_NM": "경기도", "PAN_SS": "공고중", "PAN_NT_ST_DT": "2026.10.30", "CLSG_DT": "2026.11.12", "CCR_CNNT_SYS_DS_CD": "03", "SPL_INF_TP_CD": "063", "DTL_URL": "https://apply.lh.or.kr/lhapply/apply/wt/wrtanc/selectWrtancInfo.do?panId=2015122300019236&ccrCnntSysDsCd=03&uppAisTpCd=06&aisTpCd=10"},
+    {"RNUM": "2", "ALL_CNT": "2", "PAN_ID": "2015122300019001", "PAN_NM": "울산송정 B-3 공공임대 입주자 모집", "UPP_AIS_TP_CD": "06", "UPP_AIS_TP_NM": "임대주택", "AIS_TP_CD": "08", "AIS_TP_CD_NM": "공공임대", "CNP_CD_NM": "울산광역시", "PAN_SS": "공고중", "PAN_NT_ST_DT": "2026.10.28", "CLSG_DT": "2026.11.20", "CCR_CNNT_SYS_DS_CD": "03", "SPL_INF_TP_CD": "060", "DTL_URL": "https://apply.lh.or.kr/lhapply/apply/wt/wrtanc/selectWrtancInfo.do?panId=2015122300019001&ccrCnntSysDsCd=03&uppAisTpCd=06&aisTpCd=08"}
+  ]},
+  {"resHeader": [{"SS_CODE": "Y", "RS_DTTM": "20261101060000"}]}
+]

@@ -1,0 +1,8 @@
+[
+  {"_source": "실제 응답(live) 2026-11-01 — PAN_ID 2015122300020960, CCR_CNNT_SYS_DS_CD 03, SPL_INF_TP_CD 063, UPP_AIS_TP_CD 06의 dsSplScdl[0] 그대로. 다른 블록(dsSplScdlNm 등)은 생략"},
+  {
+    "dsSplScdl": [
+      {"PPR_SBM_OPE_ANC_DT": "2026.11.19", "PPR_ACP_CLSG_DT": "2026.11.26", "PZWR_ANC_DT": "2027.03.24", "CTRT_ED_DT": "2027.04.08", "SBD_LGO_NM": "", "SBSC_ACP_ST_DT": "2026.11.10", "ACP_DTTM": "~", "SBSC_ACP_CLSG_DT": "2026.11.12", "CTRT_ST_DT": "2027.04.06", "PPR_ACP_ST_DT": "2026.11.20"}
+    ]
+  }
+]

@@ -1,0 +1,14 @@
+[
+  {"_note": "research.md 8 실측(2026-11-01) 재구성 - 행복주택 SPL_INF_TP_CD 063, dsList01. 실제 응답 표본 캡처 대기"},
+  {"dsSch": [{"PAN_ID": "2015122300019236", "CCR_CNNT_SYS_DS_CD": "03", "SPL_INF_TP_CD": "063", "UPP_AIS_TP_CD": "06"}]},
+  {
+    "dsList01": [
+      {"SBD_LGO_NM": "과천지식정보타운 S12", "HTY_NNA": "16A", "DDO_AR": "16.98", "SPL_AR": "26.22", "HSH_CNT": "400", "NOW_HSH_CNT": "342", "LS_GMY": "공고문 참조", "RFE": "공고문 참조"},
+      {"SBD_LGO_NM": "과천지식정보타운 S12", "HTY_NNA": "36A", "DDO_AR": "36.88", "SPL_AR": "52.10", "HSH_CNT": "120", "NOW_HSH_CNT": "98", "LS_GMY": "48,000,000", "RFE": "220000"}
+    ],
+    "dsList01Nm": [
+      {"SBD_LGO_NM": "단지명", "HTY_NNA": "주택형", "DDO_AR": "전용면적", "SPL_AR": "공급면적", "HSH_CNT": "세대수", "NOW_HSH_CNT": "금회공급세대수", "LS_GMY": "임대보증금", "RFE": "월임대료"}
+    ]
+  },
+  {"resHeader": [{"SS_CODE": "Y", "RS_DTTM": "20261101093000"}]}
+]
