@@ -2,17 +2,19 @@ name: Build LH notice cache
 
 # Every run also (LH청약알리미 plan A9):
 #   - sends a Telegram notice: every failure, and one success summary a day
-#     (the 06 KST run) plus every manual run
+#     (the 06:23 KST run) plus every manual run
 #     (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID; skipped if unset)
 #   - re-enables this workflow so GitHub's 60-day inactivity pause on
 #     public-repo schedules never kicks in (keepalive job)
 
 on:
   schedule:
-    # UTC 21,03,09,15 = KST 06,12,18,24. The 06 KST entry is its own line so
-    # the success notice can be limited to it (github.event.schedule).
-    - cron: "0 21 * * *"
-    - cron: "0 3,9,15 * * *"
+    # UTC 21,03,09,15 = KST 06,12,18,24, at :23 rather than on the hour
+    # (GitHub delays or drops on-the-hour schedules more often; plan A10).
+    # The 06:23 KST entry is its own line so the success notice can be
+    # limited to it (github.event.schedule).
+    - cron: "23 21 * * *"
+    - cron: "23 3,9,15 * * *"
   workflow_dispatch:
     inputs:
       force_fail:
@@ -85,12 +87,12 @@ jobs:
           git push origin HEAD:main
           echo "changed=true" >> "${GITHUB_OUTPUT}"
 
-      # Failures always; success only for the 06 KST schedule and manual runs.
+      # Failures always; success only for the 06:23 KST schedule and manual runs.
       - name: Telegram notice
         if: >-
           always() && (job.status != 'success'
           || github.event_name == 'workflow_dispatch'
-          || github.event.schedule == '0 21 * * *')
+          || github.event.schedule == '23 21 * * *')
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
