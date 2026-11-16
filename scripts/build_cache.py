@@ -92,10 +92,15 @@ class Config:
     fail_ratio: float = 0.8      # exit 1 when this share of detail calls fail ...
     fail_min_count: int = 5      # ... and at least this many failed
     sleep_seconds: float = 0.3
+    list_retry_pause_seconds: float = 5.0  # wait before asking failed list combos once more
 
 
 class ApiError(Exception):
     """A response that must not overwrite the previous value."""
+
+
+class CallCapReached(ApiError):
+    """The per-run call cap was hit; asking again cannot help."""
 
 
 class DeadlineReached(Exception):
@@ -192,6 +197,7 @@ class Builder:
         self.stats = {
             "listed": 0, "notices": 0, "refreshed": 0,
             "list_calls": 0, "supply_calls": 0, "schedule_calls": 0,
+            "list_retried": 0,
             "failures": {"list": 0, "supply": 0, "schedule": 0},
             "dropped": 0, "skipped_by_cap": 0, "skipped_by_deadline": 0,
         }
@@ -219,22 +225,68 @@ class Builder:
     # -- listing ----------------------------------------------------------
 
     def list_notices(self) -> tuple[dict, int, int]:
-        """Return ({PAN_ID: row}, ok_combos, failed_combos)."""
+        """Return ({PAN_ID: row}, ok_combos, failed_combos).
+
+        A combo that fails with an API or transport error is asked once more
+        after every combo has had its turn (plan A11). A combo stopped by the
+        deadline or the call cap is final: asking again cannot help.
+        `failures.list` counts combos that are still failed after that;
+        `list_retried` counts combos that were really asked again."""
         rows: dict = {}
         ok = failed = 0
+        retry: list[tuple[str, str]] = []
         for upp in UPP_TYPES:
             for status in STATUSES:
-                try:
-                    for r in self.list_combo(upp, status):
-                        rows.setdefault(str(r.get("PAN_ID", "")).strip(), r)
+                error = self._list_into(rows, upp, status)
+                if error is None:
                     ok += 1
-                except (ApiError, DeadlineReached) as e:
+                elif _list_retryable(error):
+                    retry.append((upp, status))
+                    self.log(f"list {upp}/{status} failed, will retry: {self._reason(error)}")
+                else:
                     failed += 1
-                    self.stats["failures"]["list"] += 1
-                    reason = "deadline" if isinstance(e, DeadlineReached) else str(e)
-                    self.log(f"list {upp}/{status} failed: {redact(reason, self.key)}")
+                    self._list_failed(upp, status, error)
+        pause = self._retry_pause() if retry else 0.0
+        if pause > 0:
+            self.sleep(pause)
+        for upp, status in retry:
+            calls_before = self.stats["list_calls"]
+            error = self._list_into(rows, upp, status)
+            if self.stats["list_calls"] > calls_before:  # count only combos really asked again
+                self.stats["list_retried"] += 1
+            if error is None:
+                ok += 1
+            else:
+                failed += 1
+                self._list_failed(upp, status, error)
         rows.pop("", None)
         return rows, ok, failed
+
+    def _list_into(self, rows: dict, upp: str, status: str) -> Exception | None:
+        """Add one combo's rows; return the error instead of raising."""
+        try:
+            listed = self.list_combo(upp, status)
+        except (ApiError, DeadlineReached) as e:
+            return e
+        for r in listed:
+            rows.setdefault(str(r.get("PAN_ID", "")).strip(), r)
+        return None
+
+    def _retry_pause(self) -> float:
+        """Pause before the retry pass, never longer than the time left before the deadline."""
+        pause = self.config.list_retry_pause_seconds
+        left = self.config.deadline_seconds - (self.clock() - self.started)
+        return min(pause, left) if pause > 0 and left > 0 else 0.0
+
+    def _reason(self, error: Exception) -> str:
+        """One log line: the key is removed and line breaks from the response are flattened."""
+        if isinstance(error, DeadlineReached):
+            return "deadline"
+        return " ".join(redact(str(error), self.key).split())
+
+    def _list_failed(self, upp: str, status: str, error: Exception) -> None:
+        self.stats["failures"]["list"] += 1
+        self.log(f"list {upp}/{status} failed: {self._reason(error)}")
 
     def list_combo(self, upp: str, status: str) -> list:
         cfg = self.config
@@ -252,7 +304,7 @@ class Builder:
         while page < page_cap:
             page += 1
             if self.calls >= cfg.max_calls:
-                raise ApiError("call cap reached while listing")
+                raise CallCapReached("call cap reached while listing")
             self.stats["list_calls"] += 1
             data = self.call(LIST_URL, {**params, "PAGE": page})
             page_rows = [r for r in merge_envelope(data).get("dsList") or [] if isinstance(r, dict)]
@@ -393,6 +445,11 @@ class Builder:
 _PRIORITY = {"new": 0, "incomplete": 1, "status_changed": 2, "correction": 3, "empty": 4, "expired": 5}
 
 
+def _list_retryable(error: Exception) -> bool:
+    """A list failure worth one more try: not the deadline, not the call cap."""
+    return isinstance(error, ApiError) and not isinstance(error, CallCapReached)
+
+
 def _int(value) -> int | None:
     try:
         return int(str(value).strip())
@@ -500,6 +557,8 @@ def main(argv=None, transport: Transport = http_get) -> int:
     parser.add_argument("--max-calls", type=int, default=Config.max_calls)
     parser.add_argument("--sleep", type=float, default=Config.sleep_seconds)
     parser.add_argument("--deadline-seconds", type=float, default=Config.deadline_seconds)
+    parser.add_argument("--list-retry-pause", type=float, default=Config.list_retry_pause_seconds,
+                        help="seconds to wait before asking failed list combos once more")
     parser.add_argument("--verbose", action="store_true", help="log each failed call (redacted)")
     args = parser.parse_args(argv)
 
@@ -514,7 +573,8 @@ def main(argv=None, transport: Transport = http_get) -> int:
 
     output = Path(args.output)
     config = Config(max_calls=args.max_calls, sleep_seconds=args.sleep,
-                    deadline_seconds=args.deadline_seconds)
+                    deadline_seconds=args.deadline_seconds,
+                    list_retry_pause_seconds=args.list_retry_pause)
 
     def log(message: str) -> None:
         if args.verbose:

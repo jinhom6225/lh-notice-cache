@@ -191,6 +191,200 @@ class ListingTests(unittest.TestCase):
         self.assertFalse(ok)
 
 
+class FlakyList(FakeTransport):
+    """Fails the first `times` list calls of one (type, status) combo with a transport error."""
+
+    def __init__(self, fail, times, **kwargs):
+        super().__init__(**kwargs)
+        self.fail = fail
+        self.left = times
+
+    def __call__(self, url, params):
+        if (url == build_cache.LIST_URL and self.left > 0
+                and (params["UPP_AIS_TP_CD"], params["PAN_SS"]) == self.fail):
+            self.left -= 1
+            self.calls.append((url, dict(params)))
+            raise urllib.error.URLError("_ssl.c:994: The handshake operation timed out")
+        return super().__call__(url, params)
+
+    def list_combos(self):
+        return [(p["UPP_AIS_TP_CD"], p["PAN_SS"]) for u, p in self.calls if u == build_cache.LIST_URL]
+
+
+class ListRetryTests(unittest.TestCase):
+    """Plan A11: a list combo that fails is asked once more after the others."""
+
+    COMBO = ("39", "공고중")
+    LISTING = {("06", "공고중"): [list_body([row("p1")])],
+               ("39", "공고중"): [list_body([row("late", upp="39")])]}
+
+    def test_a_failed_combo_is_retried_once_and_its_notices_are_kept(self):
+        t = FlakyList(self.COMBO, 1, listing=self.LISTING)
+        doc, ok = run_build(t)
+        self.assertTrue(ok)
+        self.assertEqual(set(doc["notices"]), {"p1", "late"})
+        self.assertEqual(t.list_combos().count(self.COMBO), 2)
+        self.assertEqual(doc["stats"]["failures"]["list"], 0)
+        self.assertEqual(doc["stats"]["list_retried"], 1)
+
+    def test_a_combo_that_fails_twice_counts_as_one_failure_and_is_not_asked_a_third_time(self):
+        t = FlakyList(self.COMBO, 99, listing=self.LISTING)
+        doc, ok = run_build(t)
+        self.assertTrue(ok)
+        self.assertEqual(set(doc["notices"]), {"p1"})
+        self.assertEqual(t.list_combos().count(self.COMBO), 2)
+        self.assertEqual(doc["stats"]["failures"]["list"], 1)
+        self.assertEqual(doc["stats"]["list_retried"], 1)
+
+    def test_the_retry_comes_after_every_other_combo(self):
+        t = FlakyList(self.COMBO, 1, listing=self.LISTING)
+        run_build(t)
+        combos = t.list_combos()
+        self.assertEqual(combos[-1], self.COMBO)
+        self.assertEqual(len(combos), 13)  # 12 combos + 1 retry
+
+    def test_pauses_once_before_retrying_and_not_at_all_without_failures(self):
+        def pauses(transport):
+            slept = []
+            config = build_cache.Config(sleep_seconds=0)
+            build_cache.build(None, KEY, transport, NOW, config, sleep=slept.append, clock=lambda: 0.0)
+            return slept
+
+        self.assertEqual(pauses(FlakyList(self.COMBO, 1, listing=self.LISTING)),
+                         [build_cache.Config().list_retry_pause_seconds])
+        self.assertEqual(pauses(FakeTransport(listing=self.LISTING)), [])
+        self.assertEqual(build_cache.Config().list_retry_pause_seconds, 5.0)
+
+    def test_no_retry_statistic_when_nothing_failed(self):
+        doc, _ = run_build(FakeTransport(listing=self.LISTING))
+        self.assertEqual(doc["stats"]["list_retried"], 0)
+        self.assertEqual(doc["stats"]["failures"]["list"], 0)
+
+    def test_combos_stopped_by_the_deadline_are_not_retried(self):
+        ticks = iter([0.0, 0.0, 0.0] + [100.0] * 100)  # start + 2 calls in time, then past the deadline
+        t = FakeTransport(listing=self.LISTING)
+        doc, ok = run_build(t, clock=lambda: next(ticks), deadline_seconds=10)
+        self.assertTrue(ok)
+        self.assertEqual(len([u for u, _p in t.calls if u == build_cache.LIST_URL]), 2)
+        self.assertEqual(doc["stats"]["list_retried"], 0)
+        self.assertEqual(doc["stats"]["failures"]["list"], 10)
+
+    def test_combos_stopped_by_the_call_cap_are_not_retried(self):
+        t = FakeTransport()
+        doc, ok = run_build(t, max_calls=2)
+        self.assertTrue(ok)
+        self.assertEqual(len([u for u, _p in t.calls if u == build_cache.LIST_URL]), 2)
+        self.assertEqual(doc["stats"]["list_retried"], 0)
+        self.assertEqual(doc["stats"]["failures"]["list"], 10)
+
+    def test_a_retry_that_hits_the_call_cap_is_a_failure(self):
+        # 12 first attempts use the whole cap; the retry has no call left
+        t = FlakyList(("06", "공고중"), 1, listing=self.LISTING)
+        doc, ok = run_build(t, max_calls=12)
+        self.assertTrue(ok)
+        self.assertEqual(len(t.list_combos()), 12)
+        self.assertEqual(doc["stats"]["list_retried"], 0)  # never asked again: no call was left
+        self.assertEqual(doc["stats"]["failures"]["list"], 1)
+
+    def test_a_combo_saved_by_the_retry_does_not_block_the_30_day_drop(self):
+        prev = prev_doc({"gone_old": prev_entry(NOW - timedelta(days=3), last_seen=NOW - timedelta(days=40))})
+        doc, ok = run_build(FlakyList(self.COMBO, 1, listing=self.LISTING), prev=prev)
+        self.assertTrue(ok)
+        self.assertNotIn("gone_old", doc["notices"])
+        self.assertEqual(doc["stats"]["dropped"], 1)
+
+    def test_a_combo_that_fails_twice_still_blocks_the_30_day_drop(self):
+        prev = prev_doc({"gone_old": prev_entry(NOW - timedelta(days=3), last_seen=NOW - timedelta(days=40))})
+        doc, _ = run_build(FlakyList(self.COMBO, 99, listing=self.LISTING), prev=prev)
+        self.assertIn("gone_old", doc["notices"])
+        self.assertEqual(doc["stats"]["dropped"], 0)
+
+    def test_ok_and_failed_combos_always_add_up_to_twelve(self):
+        for times in (0, 1, 99):
+            builder = build_cache.Builder(KEY, FlakyList(self.COMBO, times, listing=self.LISTING), NOW,
+                                          build_cache.Config(sleep_seconds=0), lambda _s: None,
+                                          lambda _m: None, lambda: 0.0)
+            _rows, ok, failed = builder.list_notices()
+            self.assertEqual((ok + failed, failed), (12, 1 if times == 99 else 0))
+
+    def test_rows_of_a_failed_attempt_do_not_leak_into_the_result(self):
+        class FailsOnPageTwo(FakeTransport):
+            def __call__(self, url, params):
+                if url == build_cache.LIST_URL and params["UPP_AIS_TP_CD"] == "39" and int(params["PAGE"]) == 2:
+                    self.calls.append((url, dict(params)))
+                    raise urllib.error.URLError("down")
+                return super().__call__(url, params)
+
+        page1 = list_body([row(f"half{i}", upp="39") for i in range(100)], all_cnt=150)
+        t = FailsOnPageTwo(listing={("06", "공고중"): [list_body([row("p1")])], ("39", "공고중"): [page1]})
+        doc, ok = run_build(t, max_calls=2000)
+        self.assertTrue(ok)
+        self.assertEqual(set(doc["notices"]), {"p1"})
+        self.assertEqual(doc["stats"]["failures"]["list"], 1)
+
+    def test_two_failed_combos_share_one_pause(self):
+        class TwoFlaky(FlakyList):
+            def __call__(self, url, params):
+                combo = (params.get("UPP_AIS_TP_CD"), params.get("PAN_SS"))
+                if url == build_cache.LIST_URL and combo in self.fail and combo not in self.seen:
+                    self.seen.add(combo)
+                    self.calls.append((url, dict(params)))
+                    raise urllib.error.URLError("down")
+                return FakeTransport.__call__(self, url, params)
+
+        t = TwoFlaky({("39", "공고중"), ("13", "접수중")}, 0, listing=self.LISTING)
+        t.seen = set()
+        slept = []
+        doc, _ = build_cache.build(None, KEY, t, NOW, build_cache.Config(sleep_seconds=0),
+                                   sleep=slept.append, clock=lambda: 0.0)
+        self.assertEqual(slept, [5.0])
+        self.assertEqual(doc["stats"]["list_retried"], 2)
+
+    def test_no_pause_when_it_is_zero_or_the_deadline_has_passed(self):
+        def pauses(clock, **cfg):
+            slept = []
+            build_cache.build(None, KEY, FlakyList(self.COMBO, 1, listing=self.LISTING), NOW,
+                              build_cache.Config(sleep_seconds=0, **cfg), sleep=slept.append, clock=clock)
+            return slept
+
+        self.assertEqual(pauses(lambda: 0.0, list_retry_pause_seconds=0), [])
+        ticks = iter([0.0] * 13 + [100.0] * 100)  # start + 12 list calls in time, then past the deadline
+        self.assertEqual(pauses(lambda: next(ticks), deadline_seconds=10), [])
+
+    def test_the_pause_is_cut_to_the_time_left_before_the_deadline(self):
+        slept = []
+        build_cache.build(None, KEY, FlakyList(self.COMBO, 1, listing=self.LISTING), NOW,
+                          build_cache.Config(sleep_seconds=0, list_retry_pause_seconds=float("inf"),
+                                             deadline_seconds=30),
+                          sleep=slept.append, clock=lambda: 0.0)
+        self.assertEqual(slept, [30])
+
+    def test_failure_reasons_are_logged_on_one_line_without_the_key(self):
+        class NastyGateway(FakeTransport):
+            def __call__(self, url, params):
+                if url == build_cache.LIST_URL and params["UPP_AIS_TP_CD"] == "39":
+                    self.calls.append((url, dict(params)))
+                    return f"<x><returnAuthMsg>BAD\n::error::forged {KEY}</returnAuthMsg></x>"
+                return super().__call__(url, params)
+
+        logs = []
+        build_cache.build(None, KEY, NastyGateway(listing=self.LISTING), NOW,
+                          build_cache.Config(sleep_seconds=0, list_retry_pause_seconds=0),
+                          sleep=lambda _s: None, log=logs.append, clock=lambda: 0.0)
+        mine = [m for m in logs if m.startswith("list 39/")]
+        self.assertEqual(len(mine), 6)  # 3 combos: one "will retry" and one final line each
+        for message in mine:
+            self.assertNotIn("\n", message)
+            self.assertNotIn(KEY, message)
+            self.assertIn("BAD ::error::forged", message)
+
+    def test_every_combo_failing_twice_still_reports_not_ok(self):
+        t = FakeTransport(list_error=urllib.error.URLError("down"))
+        _doc, ok = run_build(t)
+        self.assertFalse(ok)
+        self.assertEqual(len(t.calls), 24)
+
+
 class EntryShapeTests(unittest.TestCase):
     def test_supply_keeps_only_dslist_blocks_and_schedule_only_dssplscdl(self):
         page = list_body([row("2015122300019236")])
@@ -432,7 +626,7 @@ class OutputTests(unittest.TestCase):
         self.assertIn("data.go.kr", doc["source"])
         self.assertIn("이용허락범위 제한 없음", doc["license"])
         for name in ("listed", "notices", "refreshed", "list_calls", "supply_calls",
-                     "schedule_calls", "failures", "dropped", "skipped_by_cap",
+                     "schedule_calls", "list_retried", "failures", "dropped", "skipped_by_cap",
                      "skipped_by_deadline"):
             self.assertIn(name, doc["stats"])
         self.assertEqual(doc["stats"]["listed"], 1)
@@ -458,10 +652,22 @@ class MainTests(unittest.TestCase):
         with mock.patch.dict(os.environ, env, clear=True), \
                 contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
             code = build_cache.main(
-                ["--output", str(self.out), "--sleep", "0", *extra_args],
+                ["--output", str(self.out), "--sleep", "0", "--list-retry-pause", "0", *extra_args],
                 transport=transport,
             )
         return code, stdout.getvalue() + stderr.getvalue()
+
+    def test_list_retry_pause_flag_reaches_the_builder(self):
+        seen = []
+        real_build = build_cache.build
+
+        def spy(previous, key, transport, now, config, **kwargs):
+            seen.append(config.list_retry_pause_seconds)
+            return real_build(previous, key, transport, now, config, **kwargs)
+
+        with mock.patch.object(build_cache, "build", spy):
+            self.run_main(FakeTransport(), extra_args=["--list-retry-pause", "2.5"])
+        self.assertEqual(seen, [2.5])
 
     def test_missing_key_fails_clearly_without_writing(self):
         code, logs = self.run_main(FakeTransport(), env_key=None)
